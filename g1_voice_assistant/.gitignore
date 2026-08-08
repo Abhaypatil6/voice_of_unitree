@@ -1,0 +1,42 @@
+# Secrets – NEVER commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.whl
+.venv/
+venv/
+env/
+
+# Conversation artifacts (large, generated at runtime)
+conversations/
+
+# Logs
+logs/*.log
+
+# TTS model binaries
+tts/models/*.onnx
+tts/models/*.onnx.json
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ROS
+install/
+build/
+log/

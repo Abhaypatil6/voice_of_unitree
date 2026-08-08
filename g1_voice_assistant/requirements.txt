@@ -1,0 +1,39 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# G1 Voice Assistant – Python dependencies
+#
+# IMPORTANT: This project runs on Python 3.8 / Ubuntu 20.04 / ARM64 (Jetson).
+# All packages here must be verified compatible with that target.
+# Do NOT blindly add packages that require Python 3.9+.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+python-dotenv>=0.21.0,<2.0.0
+
+# ── LLM ────────────────────────────────────────────────────────────────────────
+# Groq SDK (OpenAI-compatible)
+groq>=0.9.0
+
+# ── TTS (Piper – offline, ARM64 compatible) ───────────────────────────────────
+# piper-tts provides pre-built ARM64 wheels for Jetson:
+#   pip install piper-tts
+# If not available via pip on ARM64, install from release binary:
+#   https://github.com/rhasspy/piper/releases
+# Uncomment only if confirmed available on target:
+# piper-tts>=1.2.0
+
+# ── Audio playback ─────────────────────────────────────────────────────────────
+# sounddevice: for local speaker playback (development/testing)
+sounddevice>=0.4.0
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=7.0.0
+
+# ── Type checking (optional, dev only) ────────────────────────────────────────
+# mypy>=1.0.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOT included here (installed system-wide or via ROS):
+#   rclpy              – installed with ROS 2
+#   std_msgs           – installed with ROS 2
+#   unitree_sdk2py     – installed from Unitree's repository
+# ─────────────────────────────────────────────────────────────────────────────
