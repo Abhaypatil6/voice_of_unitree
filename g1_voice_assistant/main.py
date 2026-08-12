@@ -20,9 +20,12 @@ Python 3.8 compatible.
 
 from __future__ import annotations
 
+import json
 import signal
 import sys
+import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -81,62 +84,121 @@ class VoiceAssistantPipeline:
         self._speaker = g1_speaker
         self._conv = conv_manager
         self._counter: int = 0
-        self._is_speaking: bool = False  # echo suppression flag
+        self._state: str = "LISTENING"
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Main callback (called by G1Listener on each valid transcript)
-    # ──────────────────────────────────────────────────────────────────────────
+    def _set_state(self, state: str) -> None:
+        self._state = state
+        logger.info("Pipeline state: %s", state)
 
-    def on_transcript(self, payload: Dict[str, Any], transcript: str) -> None:
+    def run_turn(
+        self,
+        payload: Dict[str, Any],
+        transcript: str,
+        received_ts: Optional[float] = None,
+    ) -> None:
         """
-        Full pipeline handler.  Called in the ROS spin thread.
-
-        Design: each stage saves its artifact before proceeding.
-        If any stage fails, subsequent stages are skipped but previous
-        artifacts are preserved.
+        Full pipeline handler.  Executed in the main thread synchronously.
         """
-        # ── Echo suppression: ignore transcripts while speaking ───────────
-        if self._is_speaking:
-            logger.info("Pipeline: skipping transcript (currently speaking)")
-            return
-
         self._counter += 1
         turn = self._counter
+        self._set_state("PROCESSING")
         logger.info("=" * 55)
         logger.info("[Turn %d] USER: %s", turn, transcript)
+
+        turn_dir = self._art.session_dir / f"turn_{turn:06d}"
+        turn_dir.mkdir(parents=True, exist_ok=True)
+
+        if received_ts is None:
+            received_ts = time.time()
+
+        # Log the final STT transcript and raw payload for this exact turn.
+        (turn_dir / "user_stt.txt").write_text(transcript, encoding="utf-8")
+        if payload is not None:
+            (turn_dir / "stt_payload.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+        metadata: Dict[str, Any] = {
+            "turn_id": turn,
+            "user_text": transcript,
+            "assistant_text": None,
+            "timestamps": {
+                "stt_received": received_ts,
+                "llm_start": None,
+                "llm_end": None,
+                "tts_start": None,
+                "tts_end": None,
+                "playback_start": None,
+                "playback_end": None,
+            },
+            "status": "processing",
+            "errors": {},
+        }
+
+        def _save_metadata(status: str) -> None:
+            metadata["status"] = status
+            metadata["updated_at"] = datetime.now().isoformat()
+            (turn_dir / "metadata.json").write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+        _save_metadata("processing")
 
         # ── Stage 2: LLM ──────────────────────────────────────────────────
         response_text: Optional[str] = None
         try:
+            metadata["timestamps"]["llm_start"] = time.time()
             response_text = self._groq.generate(
                 counter=turn,
                 transcript=transcript,
                 history=self._conv.history,
             )
+            metadata["timestamps"]["llm_end"] = time.time()
+            metadata["assistant_text"] = response_text
             logger.info("[Turn %d] G1  : %s", turn, response_text)
         except LLMError as exc:
+            metadata["errors"]["llm"] = str(exc)
+            _save_metadata("llm_failed")
             logger.error("[Turn %d] LLM failed: %s", turn, exc)
             return  # STT artifact already saved; abort this turn
 
         # Update conversation history
         self._conv.add_exchange(transcript, response_text)
 
+        # Persist the LLM response inside this turn directory.
+        (turn_dir / "llm_response.txt").write_text(response_text, encoding="utf-8")
+
         # ── Stage 3: TTS ──────────────────────────────────────────────────
         if self._tts is None:
             logger.info("[Turn %d] TTS disabled – response not spoken", turn)
+            _save_metadata("tts_disabled")
             return
 
-        wav_path = _TTS_OUTPUT_DIR / f"response_{turn:06d}.wav"
-        wav_path.parent.mkdir(parents=True, exist_ok=True)
+        # If audio artifacts are disabled, generate into a temp WAV first and
+        # preserve only the final playback file if requested.
+        if config.tts.save_audio_artifacts:
+            wav_path = turn_dir / f"response_{turn:06d}.wav"
+            wav_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            wav_path = Path(temp_file.name)
+            temp_file.close()
 
         tts_start = time.monotonic()
         wav_generated: Optional[Path] = None
         tts_error: Optional[str] = None
 
         try:
+            metadata["timestamps"]["tts_start"] = time.time()
             wav_generated = self._tts.synthesize(response_text, wav_path)
+            metadata["timestamps"]["tts_end"] = time.time()
         except TTSError as exc:
             tts_error = str(exc)
+            metadata["errors"]["tts"] = tts_error
+            metadata["timestamps"]["tts_end"] = time.time()
+            _save_metadata("tts_failed")
             logger.error("[Turn %d] TTS failed: %s", turn, exc)
 
         tts_latency = time.monotonic() - tts_start
@@ -160,19 +222,53 @@ class VoiceAssistantPipeline:
         )
 
         if tts_error or wav_generated is None:
+            if not config.tts.save_audio_artifacts:
+                try:
+                    if wav_generated is not None:
+                        wav_generated.unlink()
+                    elif wav_path is not None and wav_path.exists():
+                        wav_path.unlink()
+                except Exception:
+                    pass
             return  # LLM artifact saved; TTS artifact saved; abort speaker
+
+        if self._tts.speaks_directly:
+            logger.info("[Turn %d] TTS engine speaks directly through the robot speaker; skipping local playback.", turn)
+            metadata["status"] = "complete"
+            _save_metadata(metadata["status"])
+            return
 
         # ── Stage 4: Speaker ──────────────────────────────────────────────
         if self._speaker is None:
+            _save_metadata("speaker_disabled")
+            if not config.tts.save_audio_artifacts:
+                try:
+                    wav_generated.unlink()
+                except Exception:
+                    pass
             return
 
-        self._is_speaking = True
+        self._set_state("SPEAKING")
+        playback_success = False
         try:
-            self._speaker.play(counter=turn, audio_path=wav_generated)
-        finally:
-            self._is_speaking = False
+            metadata["timestamps"]["playback_start"] = time.time()
+            playback_success = self._speaker.play(counter=turn, audio_path=wav_generated)
+            metadata["timestamps"]["playback_end"] = time.time()
+        except Exception as exc:
+            metadata["errors"]["speaker"] = str(exc)
+            metadata["timestamps"]["playback_end"] = time.time()
+            logger.error("[Turn %d] Playback failed: %s", turn, exc)
 
+        if not config.tts.save_audio_artifacts:
+            try:
+                wav_generated.unlink()
+            except Exception:
+                pass
+
+        metadata["status"] = "complete" if playback_success else "speaker_failed"
+        _save_metadata(metadata["status"])
         logger.info("[Turn %d] complete", turn)
+        self._set_state("LISTENING")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,6 +301,16 @@ def main() -> None:
     config.paths.conversation_dir.mkdir(parents=True, exist_ok=True)
     artifact_logger = ArtifactLogger(base_dir=config.paths.conversation_dir)
 
+    # ── Initialise ROS 2 ──────────────────────────────────────────────────
+    ros = ROSInterface(node_name="g1_voice_assistant")
+    try:
+        ros.init()
+    except ImportError as exc:
+        logger.critical("ROS 2 not available: %s", exc)
+        logger.critical("Source your ROS 2 setup script:\n    source /opt/ros/foxy/setup.bash")
+        artifact_logger.finalise()
+        sys.exit(1)
+
     # ── Initialise Groq client ────────────────────────────────────────────
     try:
         groq_client = GroqClient(
@@ -228,24 +334,38 @@ def main() -> None:
             piper_models_dir=config.tts.piper_models_dir,
             piper_binary=config.tts.piper_binary,
             piper_length_scale=config.tts.piper_length_scale,
+            fallback_english_model=config.tts.piper_fallback_model,
+            espeak_voice=config.tts.espeak_voice,
+            espeak_speed=config.tts.espeak_speed,
+            unitree_sdk_path=config.tts.unitree_sdk_path,
+            unitree_speaker_id=config.tts.unitree_speaker_id,
+            unitree_network_interface=config.speaker.unitree_network_interface,
+            unitree_fallback=config.tts.unitree_fallback,
         )
     except (TTSError, ValueError, ImportError) as exc:
         logger.warning("TTS engine failed to initialise: %s", exc)
         logger.warning("Voice responses will be SKIPPED (text-only mode).")
         tts_engine = None
+    else:
+        if tts_engine is not None and tts_engine.speaks_directly:
+            logger.info("Unitree native speaker: READY")
+            logger.info("Unitree network interface: %s", config.speaker.unitree_network_interface or "eth0")
+            logger.info("Unitree speaker ID: %s", config.tts.unitree_speaker_id)
 
     # ── Initialise speaker ────────────────────────────────────────────────
     g1_speaker: Optional[G1Speaker] = None
-    if tts_engine is not None:
+    if tts_engine is not None and not tts_engine.speaks_directly:
         try:
             raw_speaker = create_speaker(
                 backend=config.speaker.backend,
                 alsa_device=config.speaker.alsa_output_device,
+                network_interface=config.speaker.unitree_network_interface,
             )
-            g1_speaker = G1Speaker(
-                speaker=raw_speaker,
-                artifact_logger=artifact_logger,
-            )
+            if raw_speaker is not None:
+                g1_speaker = G1Speaker(
+                    speaker=raw_speaker,
+                    artifact_logger=artifact_logger,
+                )
         except (ValueError, Exception) as exc:
             logger.warning("Speaker failed to initialise: %s", exc)
             logger.warning("Audio playback will be SKIPPED.")
@@ -265,19 +385,8 @@ def main() -> None:
         conv_manager=conv_manager,
     )
 
-    # ── Initialise ROS 2 ──────────────────────────────────────────────────
-    ros = ROSInterface(node_name="g1_voice_assistant")
-    try:
-        ros.init()
-    except ImportError as exc:
-        logger.critical("ROS 2 not available: %s", exc)
-        logger.critical("Source your ROS 2 setup script:\n    source /opt/ros/foxy/setup.bash")
-        artifact_logger.finalise()
-        sys.exit(1)
-
     listener = G1Listener(
         artifact_logger=artifact_logger,
-        on_transcript_callback=pipeline.on_transcript,
         min_text_length=config.ros.min_text_length,
         min_confidence=config.ros.min_confidence,
         topic=config.ros.audio_topic,
@@ -289,18 +398,28 @@ def main() -> None:
     )
 
     # ── Print startup summary ─────────────────────────────────────────────
-    tts_status = tts_engine.engine_name if tts_engine else "DISABLED"
-    spk_status = g1_speaker is not None
+    if tts_engine is None:
+        tts_status = "DISABLED"
+    else:
+        tts_status = tts_engine.engine_name
+
+    if tts_engine is not None and tts_engine.speaks_directly:
+        speaker_status = "Unitree native TTS (direct via robot audio service)"
+    else:
+        speaker_status = config.speaker.backend if g1_speaker is not None else "DISABLED"
+
     logger.info("")
     logger.info("✓ ROS 2 node started")
     logger.info("✓ Listening on: %s", config.ros.audio_topic)
     logger.info("  TTS engine : %s", tts_status)
-    logger.info("  Speaker    : %s", "enabled" if spk_status else "DISABLED")
+    logger.info("  Speaker    : %s", speaker_status)
     logger.info("")
     logger.info("Waiting for speech …  (Ctrl+C to stop)")
     logger.info("=" * 60)
 
     # ── Spin ──────────────────────────────────────────────────────────────
+    ros.spin_in_background()
+    
     shutdown_event = [False]
 
     def _sig_handler(signum: int, frame: Any) -> None:
@@ -312,7 +431,20 @@ def main() -> None:
 
     try:
         while not shutdown_event[0]:
-            ros.spin_once(timeout_sec=0.1)
+            payload, final_text, received_ts = listener.get_final_transcript(silence_timeout=1.0)
+            
+            if final_text:
+                # We have a finalized turn!
+                # 1. Stop listening (to prevent echo and duplicate buffering)
+                listener.set_listening(False)
+                
+                try:
+                    pipeline.run_turn(payload, final_text, received_ts)
+                finally:
+                    # 2. Resume listening after speaking is done
+                    listener.set_listening(True)
+            else:
+                time.sleep(0.05)
     finally:
         stats = listener.stats
         logger.info(

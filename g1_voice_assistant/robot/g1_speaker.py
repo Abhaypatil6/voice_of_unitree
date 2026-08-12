@@ -36,7 +36,11 @@ Python 3.8 compatible.
 
 from __future__ import annotations
 
+import importlib.util
+import os
+import site
 import subprocess
+import sys
 import time
 import wave
 from abc import ABC, abstractmethod
@@ -185,33 +189,147 @@ class LocalSpeaker(BaseSpeaker):
 # Backend 3 – Unitree SDK (skeleton – do NOT enable without inspecting the API)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _resolve_unitree_sdk_path(explicit_path: Optional[str] = None) -> Optional[str]:
+    if explicit_path:
+        explicit_path = os.path.expanduser(explicit_path)
+        if os.path.exists(explicit_path):
+            return explicit_path
+
+    env_path = os.environ.get("UNITREE_SDK_PATH", "").strip()
+    if env_path and os.path.exists(env_path):
+        return env_path
+
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "..", "unitree_sdk2_python"),
+        os.path.expanduser("~/Projects/unitree_sdk2_python"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return os.path.abspath(candidate)
+
+    return None
+
+
 class UnitreeSpeaker(BaseSpeaker):
     """
-    SKELETON – play audio via the Unitree G1 AudioClient SDK.
-
-    DO NOT enable this without first inspecting the actual Unitree API on the G1:
-
-        ros2 interface show unitree_go/msg/AudioData
-        ros2 topic echo /api/audiohub/request
-
-    This class will raise NotImplementedError until the real API
-    is verified and implemented.
+    Play audio via the Unitree G1 AudioClient SDK.
+    Runs the SDK in an isolated spawned process to avoid CycloneDDS domain
+    collisions with the main ROS 2 process.
     """
+    def __init__(self, network_interface: str = "eth0") -> None:
+        self._network_interface = network_interface
+
+        # We must use 'spawn' to ensure the child process does not inherit
+        # the main process's ROS 2 DDS file descriptors or memory space.
+        import multiprocessing as mp
+        import queue
+        ctx = mp.get_context("spawn")
+
+        self._queue = ctx.Queue()
+        init_status_queue = ctx.Queue()
+
+        self._process = ctx.Process(
+            target=self._worker,
+            args=(self._queue, init_status_queue, self._network_interface),
+        )
+        self._process.daemon = True
+        self._process.start()
+
+        # Wait for initialization status
+        try:
+            status = init_status_queue.get(timeout=15.0)
+            if status != "OK":
+                raise SpeakerError(f"Unitree SDK worker failed to initialize: {status}")
+        except queue.Empty:
+            if self._process.is_alive():
+                self._process.terminate()
+            raise SpeakerError("Unitree SDK worker initialization timed out.")
+
+        logger.info("UnitreeSpeaker process spawned and ready on %s", self._network_interface)
+
+    @staticmethod
+    def _worker(queue, init_status_queue, network_interface: str):
+        try:
+            sdk_path = _resolve_unitree_sdk_path(os.environ.get("UNITREE_SDK_PATH"))
+            if sdk_path:
+                sys.path.insert(0, sdk_path)
+                try:
+                    site.addsitedir(sdk_path)
+                except Exception:
+                    pass
+
+            from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+            from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
+            
+            # Isolated initialization of Unitree's CycloneDDS participant
+            try:
+                ChannelFactoryInitialize(0, network_interface)
+            except Exception as exc:
+                init_status_queue.put(f"ChannelFactoryInitialize(0) error: {exc}")
+                return
+            
+            client = AudioClient()
+            client.SetTimeout(10.0)
+            client.Init()
+            
+            # Signal success to parent process
+            init_status_queue.put("OK")
+            
+        except ImportError as exc:
+            init_status_queue.put(f"unitree_sdk2py not found. Please install bindings. {exc}")
+            return
+        except Exception as exc:
+            init_status_queue.put(f"ChannelFactory init failed: {exc}")
+            return
+
+        while True:
+            try:
+                audio_path_str = queue.get()
+                if audio_path_str is None:
+                    break
+                    
+                with wave.open(audio_path_str, "rb") as wf:
+                    if wf.getnchannels() != 1 or wf.getsampwidth() != 2:
+                        print("SpeakerError: requires 16-bit mono WAV.")
+                        continue
+                    
+                    frames = wf.readframes(wf.getnframes())
+                    sample_rate = wf.getframerate()
+                    duration = wf.getnframes() / float(sample_rate)
+                    
+                stream_id = f"g1_voice_{int(time.time())}"
+                client.PlayStream("voice_assistant", stream_id, frames)
+                
+                # Sleep to wait for playback completion
+                time.sleep(duration + 0.1)
+                
+            except Exception as exc:
+                print(f"Unitree speaker worker error: {exc}")
 
     @property
     def backend_name(self) -> str:
         return "unitree"
 
     def play(self, audio_path: Path) -> None:
-        raise NotImplementedError(
-            "UnitreeSpeaker is not yet implemented.\n"
-            "Before implementing:\n"
-            "  1. On the G1, run: ros2 topic echo /api/audiohub/request\n"
-            "  2. Inspect the message format\n"
-            "  3. Check: ros2 interface show unitree_go/msg/AudioData\n"
-            "  4. Look for existing Unitree audio examples in the SDK\n"
-            "Set SPEAKER_BACKEND=alsa to use aplay instead."
-        )
+        audio_path = Path(audio_path)
+        if not audio_path.is_file():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+            
+        # Ensure process is alive before queuing
+        if not self._process.is_alive():
+            raise SpeakerError("UnitreeSpeaker background process died unexpectedly.")
+            
+        logger.info("UnitreeSpeaker: sending %s to background process", audio_path.name)
+        self._queue.put(str(audio_path))
+        
+        # We need to block until it finishes. A simple way is to wait for the expected duration.
+        # This isn't perfect synchronization, but matches the original behavior.
+        try:
+            with wave.open(str(audio_path), "rb") as wf:
+                duration = wf.getnframes() / float(wf.getframerate())
+            time.sleep(duration + 0.2)
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,8 +408,9 @@ class G1Speaker:
 def create_speaker(
     backend: str,
     alsa_device: Optional[str] = None,
+    network_interface: Optional[str] = None,
     artifact_logger: Optional[ArtifactLogger] = None,
-) -> BaseSpeaker:
+) -> Optional[BaseSpeaker]:
     """
     Create and return the speaker backend.
 
@@ -301,6 +420,8 @@ def create_speaker(
         One of: ``alsa``, ``local``, ``unitree``.
     alsa_device:
         ALSA device string (used when backend=alsa).
+    network_interface:
+        Unitree network interface (used when backend=unitree).
     artifact_logger:
         If provided, wraps the speaker in G1Speaker for artifact logging.
     """
@@ -311,7 +432,14 @@ def create_speaker(
     elif backend == "local":
         speaker = LocalSpeaker()
     elif backend == "unitree":
-        speaker = UnitreeSpeaker()
+        try:
+            speaker = UnitreeSpeaker(network_interface=network_interface or "eth0")
+        except (SpeakerError, Exception) as exc:
+            logger.warning(
+                "Unitree speaker backend unavailable (%s); speaker output disabled.",
+                exc,
+            )
+            return None
     else:
         raise ValueError(
             f"Unknown SPEAKER_BACKEND={backend!r}. "

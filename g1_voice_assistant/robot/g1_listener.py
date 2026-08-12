@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Callable, Dict, Optional, Set
+from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 from logging_utils.logger import get_logger
 from logging_utils.artifact_logger import ArtifactLogger
@@ -72,16 +72,24 @@ class G1Listener:
     def __init__(
         self,
         artifact_logger: ArtifactLogger,
-        on_transcript_callback: Callable[[Dict[str, Any], str], None],
         min_text_length: int = 2,
         min_confidence: float = 0.0,
         topic: str = "/audio_msg",
     ) -> None:
         self._artifact_logger = artifact_logger
-        self._on_transcript = on_transcript_callback
         self._min_text_length = min_text_length
         self._min_confidence = min_confidence
         self._topic = topic
+
+        import threading
+        self._lock = threading.Lock()
+        self._is_listening = True
+        
+        self._current_payload: Optional[Dict[str, Any]] = None
+        self._current_text: str = ""
+        self._current_index: Optional[int] = None
+        self._current_received_ts: float = 0.0
+        self._last_update_ts: float = 0.0
 
         self._seen_indices: Set[int] = set()
         self._total_received: int = 0
@@ -93,6 +101,50 @@ class G1Listener:
             min_text_length,
             min_confidence,
         )
+
+    def set_listening(self, state: bool) -> None:
+        """Enable or disable processing of incoming STT messages."""
+        with self._lock:
+            self._is_listening = state
+            if state:
+                # Clear buffer when resuming
+                self._current_payload = None
+                self._current_text = ""
+                self._current_received_ts = 0.0
+                self._last_update_ts = 0.0
+                
+    def get_final_transcript(
+        self,
+        silence_timeout: float = 1.2,
+    ) -> Tuple[Optional[Dict[str, Any]], str, float]:
+        """
+        Check if the current utterance has finished (no new updates for `silence_timeout` seconds).
+        Returns (payload, text, local_received_ts). If not finalized or empty, returns (None, "", 0.0).
+        """
+        with self._lock:
+            if not self._current_text:
+                return None, "", 0.0
+                
+            if (time.time() - self._last_update_ts) > silence_timeout:
+                payload = self._current_payload
+                text = self._current_text
+                received_ts = self._current_received_ts
+                current_index = self._current_index
+                
+                # Remember this turn's index so repeated stale payloads are ignored.
+                if current_index is not None:
+                    self._seen_indices.add(current_index)
+
+                # Clear buffer
+                self._current_payload = None
+                self._current_text = ""
+                self._current_index = None
+                self._current_received_ts = 0.0
+                self._last_update_ts = 0.0
+                
+                return payload, text, received_ts
+                
+        return None, "", 0.0
 
     # ──────────────────────────────────────────────────────────────────────────
     # ROS callback
@@ -133,6 +185,10 @@ class G1Listener:
         if received_ts is None:
             received_ts = time.time()
 
+        with self._lock:
+            if not self._is_listening:
+                return False
+
         self._total_received += 1
 
         # ── Step 1: Parse JSON ─────────────────────────────────────────────
@@ -159,12 +215,16 @@ class G1Listener:
             confidence,
         )
 
-        # ── Step 3: Duplicate detection ────────────────────────────────────
+        # ── Step 3: Duplicate detection / current utterance updates ──────
         if unitree_index is not None:
-            if unitree_index in self._seen_indices:
-                logger.debug("Duplicate index %d, skipping", unitree_index)
+            if unitree_index == self._current_index:
+                if text == self._current_text:
+                    logger.debug("Duplicate current STT update, skipping")
+                    return False
+                logger.debug("Updated STT for current in-flight index %d", unitree_index)
+            elif unitree_index in self._seen_indices:
+                logger.debug("Stale STT index %d after finalization, skipping", unitree_index)
                 return False
-            self._seen_indices.add(unitree_index)
 
         # ── Step 4: Quality filters ────────────────────────────────────────
         rejection_reason: Optional[str] = None
@@ -194,23 +254,20 @@ class G1Listener:
         )
 
         self._total_accepted += 1
-        logger.info(
-            "[STT #%06d] '%s'  (idx=%s, conf=%.3f, speaker=%d, angle=%.1f, emotion=%s)",
-            counter,
+        logger.debug(
+            "[STT Partial] '%s'  (idx=%s, conf=%.3f)",
             text[:80],
             unitree_index,
             confidence,
-            speaker_id,
-            angle,
-            emotion,
         )
 
-        # ── Step 6: Fire callback ──────────────────────────────────────────
-        try:
-            self._on_transcript(payload, text)
-        except Exception as exc:  # noqa: BLE001
-            # The listener must never crash the ROS thread
-            logger.exception("Error in transcript callback: %s", exc)
+        # ── Step 6: Buffer as current utterance ────────────────────────────
+        with self._lock:
+            self._current_payload = payload
+            self._current_text = text
+            self._current_index = unitree_index
+            self._current_received_ts = received_ts
+            self._last_update_ts = received_ts
 
         return True
 

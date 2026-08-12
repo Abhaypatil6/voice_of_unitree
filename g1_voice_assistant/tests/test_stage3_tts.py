@@ -15,6 +15,7 @@ Python 3.8 compatible.
 from __future__ import annotations
 
 import sys
+import types
 import wave
 import struct
 import tempfile
@@ -180,6 +181,39 @@ def test_piper_raises_on_subprocess_error(tmp_path: Path) -> None:
             assert "piper exited" in str(exc).lower()
 
 
+def test_language_aware_piper_falls_back_to_secondary_voice() -> None:
+    """A preferred voice should fall back to a known-good model when unavailable."""
+
+    class DummyPiper:
+        def __init__(self, model_name: str, **_: object) -> None:
+            self._model_name = model_name
+            if model_name == "en_US-amy-medium":
+                raise TTSError("voice not available")
+
+        @property
+        def sample_rate(self) -> int:
+            return 22050
+
+        def synthesize(self, text: str, output_path: Path) -> Path:
+            return output_path
+
+    dummy_module = types.SimpleNamespace(PiperEngine=DummyPiper)
+    sys.modules["tts.piper_engine"] = dummy_module
+
+    from tts.tts_engine import LanguageAwarePiperEngine
+
+    engine = LanguageAwarePiperEngine(
+        english_model="en_US-amy-medium",
+        hindi_model="hi_IN-rohan-medium",
+        models_dir=Path("tts/models"),
+        piper_binary="piper",
+        piper_length_scale=1.0,
+        fallback_english_model="en_US-ryan-high",
+    )
+
+    assert engine._english_engine._model_name == "en_US-ryan-high"
+
+
 # ── Tests: ESpeakEngine ───────────────────────────────────────────────────────
 
 def test_espeak_synthesize_success(tmp_path: Path) -> None:
@@ -221,6 +255,52 @@ def test_espeak_raises_if_not_installed(tmp_path: Path) -> None:
 
 
 # ── Tests: Factory ────────────────────────────────────────────────────────────
+
+def test_create_tts_engine_unitree_explicitly_falls_back_to_piper_if_configured(tmp_path: Path) -> None:
+    """If Unitree native TTS cannot initialise and fallback is configured, the factory falls back to Piper."""
+    with patch("tts.tts_engine.UnitreeNativeTTSEngine", side_effect=TTSError("Unitree SDK missing")):
+        engine = create_tts_engine(
+            backend="unitree",
+            piper_model="en_US-test",
+            piper_hindi_model="hi_IN-test",
+            unitree_fallback="piper",
+        )
+
+    assert engine is not None
+    assert engine.engine_name == "piper"
+
+
+def test_create_tts_engine_unitree_raises_when_unavailable_and_no_fallback(tmp_path: Path) -> None:
+    """If Unitree native TTS cannot initialise without fallback, an error is raised."""
+    with patch("tts.tts_engine.UnitreeNativeTTSEngine", side_effect=TTSError("Unitree SDK missing")):
+        try:
+            create_tts_engine(
+                backend="unitree",
+                piper_model="en_US-test",
+                piper_hindi_model="hi_IN-test",
+                unitree_fallback="",
+            )
+            assert False, "Expected TTSError"
+        except TTSError as exc:
+            assert "Unitree SDK missing" in str(exc)
+
+
+def test_create_tts_engine_unitree_speaks_directly(tmp_path: Path) -> None:
+    """Unitree native TTS should be instantiated when available."""
+    class DummyUnitree:
+        engine_name = "unitree_native"
+        speaks_directly = True
+
+        def __init__(self, **_: object) -> None:
+            pass
+
+    with patch("tts.tts_engine.UnitreeNativeTTSEngine", DummyUnitree):
+        engine = create_tts_engine(backend="unitree")
+
+    assert engine is not None
+    assert engine.engine_name == "unitree_native"
+    assert engine.speaks_directly is True
+
 
 def test_create_tts_engine_none(tmp_path: Path) -> None:
     """TTS_BACKEND=none should return None."""

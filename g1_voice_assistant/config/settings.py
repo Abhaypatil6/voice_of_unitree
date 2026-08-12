@@ -86,9 +86,11 @@ class GroqConfig:
             "SYSTEM_PROMPT",
             (
                 "You are G1, a helpful voice assistant built into a "
-                "Unitree G1 humanoid robot. Keep answers concise and "
-                "conversational. No markdown, no bullet points, plain "
-                "spoken sentences only."
+                "Unitree G1 humanoid robot. Respond only in English or Hindi. "
+                "Prefer the user's language when it is English, Hindi, or Hinglish. "
+                "Do not use other languages. Keep answers concise, conversational, "
+                "and speech-friendly. Avoid markdown, lists, emojis, URLs, code, "
+                "and unnecessary characters. Do not output pronunciation instructions."
             ),
         )
     )
@@ -121,13 +123,24 @@ class TTSConfig:
     """Text-to-Speech settings."""
 
     backend: str = field(
-        default_factory=lambda: _env("TTS_BACKEND", "piper")
+        default_factory=lambda: _env("TTS_BACKEND", "unitree")
     )
-    """TTS backend: piper | espeak | none."""
+    """TTS backend: unitree | piper | espeak | none."""
 
     piper_model: str = field(
         default_factory=lambda: _env("PIPER_MODEL", "en_US-ryan-high")
     )
+    """Default English Piper model."""
+
+    piper_fallback_model: str = field(
+        default_factory=lambda: _env("PIPER_FALLBACK_MODEL", "en_US-ryan-high")
+    )
+    """Fallback English Piper model used when the preferred voice is unavailable."""
+
+    piper_hindi_model: str = field(
+        default_factory=lambda: _env("PIPER_HINDI_MODEL", "hi_IN-rohan-medium")
+    )
+    """Fallback Hindi Piper model name."""
 
     piper_models_dir: Path = field(
         default_factory=lambda: Path(_env("PIPER_MODELS_DIR", "tts/models"))
@@ -138,8 +151,42 @@ class TTSConfig:
     )
 
     piper_length_scale: float = field(
-        default_factory=lambda: _env_float("PIPER_LENGTH_SCALE", 1.0)
+        default_factory=lambda: _env_float("PIPER_LENGTH_SCALE", 0.95)
     )
+    """Speech rate: <1 faster, >1 slower."""
+
+    unitree_sdk_path: Optional[Path] = field(
+        default_factory=lambda: Path(_env("UNITREE_SDK_PATH", "")) if _env("UNITREE_SDK_PATH", "") else None
+    )
+    """Path to the Unitree SDK Python package root."""
+
+    unitree_speaker_id: int = field(
+        default_factory=lambda: _env_int(
+            "UNITREE_TTS_SPEAKER_ID",
+            _env_int("UNITREE_SPEAKER_ID", 0),
+        )
+    )
+    """Speaker ID used for Unitree native TTS."""
+
+    unitree_fallback: str = field(
+        default_factory=lambda: _env("UNITREE_FALLBACK", "").strip().lower()
+    )
+    """Optional native Unitree TTS fallback when the SDK cannot initialise. Use 'piper'."""
+
+    espeak_voice: str = field(
+        default_factory=lambda: _env("ESPEAK_VOICE", "en-us")
+    )
+    """espeak voice name for clearer speech."""
+
+    espeak_speed: int = field(
+        default_factory=lambda: _env_int("ESPEAK_SPEED", 150)
+    )
+    """espeak speaking speed in words per minute."""
+
+    save_audio_artifacts: bool = field(
+        default_factory=lambda: _env_bool("SAVE_AUDIO_ARTIFACTS", False)
+    )
+    """Whether generated WAV audio should be stored in the conversation artifacts."""
 
 
 @dataclass

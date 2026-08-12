@@ -194,6 +194,14 @@ def test_create_speaker_local(tmp_path: Path) -> None:
     assert isinstance(speaker, LocalSpeaker)
 
 
+def test_create_speaker_returns_none_when_unitree_unavailable() -> None:
+    """Missing Unitree SDK should disable the unitree speaker backend."""
+    with patch("robot.g1_speaker.UnitreeSpeaker", side_effect=SpeakerError("unitree_sdk2py not found")):
+        speaker = create_speaker("unitree")
+
+    assert speaker is None
+
+
 def test_create_speaker_invalid() -> None:
     try:
         create_speaker("invalid")

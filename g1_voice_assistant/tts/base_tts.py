@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Optional
 
 
 class TTSError(RuntimeError):
@@ -20,21 +21,23 @@ class BaseTTS(ABC):
     """Output boundary for text-to-speech synthesis."""
 
     @abstractmethod
-    def synthesize(self, text: str, output_path: Path) -> Path:
+    def synthesize(self, text: str, output_path: Optional[Path] = None) -> Optional[Path]:
         """
-        Convert *text* to speech and save as a WAV file.
+        Convert *text* to speech and save as a WAV file, or speak directly.
 
         Parameters
         ----------
         text:
             Plain text to synthesise.
         output_path:
-            Destination path for the generated WAV file.
+            Destination path for the generated WAV file, if applicable.
+            Direct native TTS backends may ignore this parameter.
 
         Returns
         -------
-        Path
-            Path to the generated WAV file (same as output_path on success).
+        Optional[Path]
+            Path to the generated WAV file, or ``None`` when speech is handled
+            directly by the robot audio service.
 
         Raises
         ------
@@ -51,3 +54,8 @@ class BaseTTS(ABC):
     def sample_rate(self) -> int:
         """Sample rate of the generated WAV (Hz).  Subclasses may override."""
         return 22050
+
+    @property
+    def speaks_directly(self) -> bool:
+        """Whether the TTS engine speaks directly through the robot speaker."""
+        return False

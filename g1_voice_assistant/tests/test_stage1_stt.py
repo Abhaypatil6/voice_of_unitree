@@ -36,16 +36,19 @@ def _make_listener(tmp_dir: Path) -> Tuple[G1Listener, List[Tuple[Dict, str]], A
 
     art = ArtifactLogger(base_dir=tmp_dir, session_ts="test_session")
 
-    def _cb(payload: Dict[str, Any], text: str) -> None:
-        received.append((payload, text))
-
     listener = G1Listener(
         artifact_logger=art,
-        on_transcript_callback=_cb,
         min_text_length=2,
         min_confidence=0.0,
     )
-    return listener, received, art
+    
+    # We patch _cb into the test so we can manually extract
+    def flush_transcript():
+        p, t = listener.get_final_transcript(silence_timeout=0.0)
+        if t:
+            received.append((p, t))
+            
+    return listener, received, art, flush_transcript
 
 
 SAMPLE_MSG = {
@@ -63,10 +66,11 @@ SAMPLE_MSG = {
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 def test_valid_transcript_accepted(tmp_path: Path) -> None:
-    """A normal transcript should be accepted and trigger the callback."""
-    listener, received, art = _make_listener(tmp_path)
+    """A normal transcript should be accepted and buffered."""
+    listener, received, art, flush = _make_listener(tmp_path)
 
     result = listener._handle_raw_json(json.dumps(SAMPLE_MSG))
+    flush()
 
     assert result is True
     assert len(received) == 1
@@ -77,7 +81,7 @@ def test_valid_transcript_accepted(tmp_path: Path) -> None:
 
 def test_artifacts_created(tmp_path: Path) -> None:
     """Accepting a transcript must create raw JSON and transcript text files."""
-    listener, received, art = _make_listener(tmp_path)
+    listener, received, art, _ = _make_listener(tmp_path)
     listener._handle_raw_json(json.dumps(SAMPLE_MSG))
 
     stt_dir = art.session_dir / "01_stt"
@@ -100,11 +104,12 @@ def test_artifacts_created(tmp_path: Path) -> None:
 
 def test_duplicate_index_rejected(tmp_path: Path) -> None:
     """The same Unitree index should only be processed once."""
-    listener, received, art = _make_listener(tmp_path)
+    listener, received, art, flush = _make_listener(tmp_path)
 
     msg_json = json.dumps(SAMPLE_MSG)
     r1 = listener._handle_raw_json(msg_json)
     r2 = listener._handle_raw_json(msg_json)  # same index=236
+    flush()
 
     assert r1 is True
     assert r2 is False
@@ -113,10 +118,11 @@ def test_duplicate_index_rejected(tmp_path: Path) -> None:
 
 def test_short_text_rejected(tmp_path: Path) -> None:
     """A transcript that is too short should be rejected."""
-    listener, received, art = _make_listener(tmp_path)
+    listener, received, art, flush = _make_listener(tmp_path)
 
     msg = {**SAMPLE_MSG, "index": 237, "text": "."}  # 1 char < min_len=2
     result = listener._handle_raw_json(json.dumps(msg))
+    flush()
 
     assert result is False
     assert len(received) == 0
@@ -124,7 +130,7 @@ def test_short_text_rejected(tmp_path: Path) -> None:
 
 def test_empty_text_rejected(tmp_path: Path) -> None:
     """Empty transcript text should be rejected."""
-    listener, received, art = _make_listener(tmp_path)
+    listener, received, art, _ = _make_listener(tmp_path)
 
     msg = {**SAMPLE_MSG, "index": 238, "text": ""}
     result = listener._handle_raw_json(json.dumps(msg))
@@ -134,9 +140,10 @@ def test_empty_text_rejected(tmp_path: Path) -> None:
 
 def test_malformed_json_rejected(tmp_path: Path) -> None:
     """Invalid JSON must be silently dropped without crashing."""
-    listener, received, art = _make_listener(tmp_path)
+    listener, received, art, flush = _make_listener(tmp_path)
 
     result = listener._handle_raw_json("{this is not valid json")
+    flush()
 
     assert result is False
     assert len(received) == 0
@@ -149,10 +156,13 @@ def test_confidence_filter(tmp_path: Path) -> None:
 
     listener = G1Listener(
         artifact_logger=art,
-        on_transcript_callback=lambda p, t: received.append(t),
         min_text_length=2,
         min_confidence=0.8,  # require 0.8
     )
+    
+    def flush():
+        p, t = listener.get_final_transcript(0.0)
+        if t: received.append(t)
 
     # Low confidence
     low_conf_msg = {**SAMPLE_MSG, "index": 300, "confidence": 0.5}
@@ -162,19 +172,22 @@ def test_confidence_filter(tmp_path: Path) -> None:
     # High confidence
     high_conf_msg = {**SAMPLE_MSG, "index": 301, "confidence": 0.9}
     r2 = listener._handle_raw_json(json.dumps(high_conf_msg))
+    flush()
     assert r2 is True
     assert len(received) == 1
 
 
 def test_different_indices_both_accepted(tmp_path: Path) -> None:
     """Two messages with different indices should both be accepted."""
-    listener, received, art = _make_listener(tmp_path)
+    listener, received, art, flush = _make_listener(tmp_path)
 
     msg1 = {**SAMPLE_MSG, "index": 100, "text": "Hello world"}
     msg2 = {**SAMPLE_MSG, "index": 101, "text": "How are you"}
 
     r1 = listener._handle_raw_json(json.dumps(msg1))
+    flush()
     r2 = listener._handle_raw_json(json.dumps(msg2))
+    flush()
 
     assert r1 is True
     assert r2 is True
@@ -188,7 +201,6 @@ def test_noisy_unitree_samples(tmp_path: Path) -> None:
 
     noisy_listener = G1Listener(
         artifact_logger=art,
-        on_transcript_callback=lambda p, t: accepted_texts.append(t),
         min_text_length=2,
         min_confidence=0.0,
     )
@@ -224,13 +236,12 @@ def test_session_json_created(tmp_path: Path) -> None:
 def test_finalise_updates_session_json(tmp_path: Path) -> None:
     """Calling finalise() should add ended_at and total_exchanges."""
     art = ArtifactLogger(base_dir=tmp_path, session_ts="finalise_test")
-    listener, received, _ = _make_listener(tmp_path)
+    listener, received, _, _ = _make_listener(tmp_path)
 
     # Use the art from _make_listener
     art2 = ArtifactLogger(base_dir=tmp_path, session_ts="finalise2_test")
     listener2 = G1Listener(
         artifact_logger=art2,
-        on_transcript_callback=lambda p, t: None,
         min_text_length=2,
     )
     listener2._handle_raw_json(json.dumps(SAMPLE_MSG))

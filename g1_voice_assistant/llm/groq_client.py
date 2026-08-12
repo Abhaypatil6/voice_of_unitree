@@ -1,22 +1,27 @@
 """
-llm/groq_client.py
-------------------
 Stage 2 – Groq LLM client.
 
 Sends conversation history + a new user transcript to the Groq API and
-returns the assistant's response text.  All request/response data is
+returns the assistant's response text. All request/response data is
 persisted via ArtifactLogger.
 
+Language policy:
+    - Assistant responses are restricted to English and Hindi.
+    - Chinese, Japanese, Korean, and other languages are not allowed.
+    - If speech recognition produces unexpected foreign characters,
+      the model should interpret the input as English/Hindi when possible.
+    - If the input is unclear, the assistant should ask for clarification
+      in English.
+
 DESIGN NOTES
-~~~~~~~~~~~~
-* Uses the official ``groq`` Python SDK (OpenAI-compatible interface).
+
+* Uses the official ``groq`` Python SDK.
 * Conversation history is a list of ``{"role": ..., "content": ...}``
   dicts, exactly as required by the Groq chat-completion API.
 * The system prompt is prepended to every request but NOT stored in the
-  rolling history object (to avoid double-counting tokens).
+  rolling history object.
 * The API key is NEVER logged or saved to any artifact.
-* Network/API errors are caught and reported; the caller decides whether
-  to continue or abort the pipeline turn.
+* Network/API errors are caught and reported.
 * On the G1, this module is the only component that requires internet.
 
 Python 3.8 compatible.
@@ -29,6 +34,7 @@ from typing import Any, Dict, List, Optional
 
 from logging_utils.logger import get_logger
 from logging_utils.artifact_logger import ArtifactLogger
+
 
 logger = get_logger(__name__)
 
@@ -44,17 +50,22 @@ class GroqClient:
     Parameters
     ----------
     api_key:
-        Groq API key (read from env; never hard-code).
+        Groq API key.
+
     model:
-        Groq model identifier, e.g. ``llama-3.1-8b-instant``.
+        Groq model identifier.
+
     system_prompt:
-        The assistant persona/instructions prepended to every request.
+        Assistant persona/instructions.
+
     max_tokens:
         Maximum number of tokens in the LLM response.
+
     temperature:
-        Sampling temperature (0.0–1.0).
+        Sampling temperature.
+
     artifact_logger:
-        :class:`ArtifactLogger` for saving request/response artifacts.
+        ArtifactLogger used for saving request/response data.
     """
 
     def __init__(
@@ -66,12 +77,14 @@ class GroqClient:
         temperature: float,
         artifact_logger: ArtifactLogger,
     ) -> None:
+
         if not api_key:
             raise ValueError(
-                "GROQ_API_KEY is empty.  "
+                "GROQ_API_KEY is empty. "
                 "Set it in .env before running:\n"
                 "    GROQ_API_KEY=gsk_<your-key-here>"
             )
+
         self._model = model
         self._system_prompt = system_prompt
         self._max_tokens = max_tokens
@@ -79,30 +92,38 @@ class GroqClient:
         self._artifact_logger = artifact_logger
         self._api_key = api_key
 
-        # Validate the SDK is importable at init time (gives early feedback)
-        # but store only the api_key; the client object is created lazily
-        # so that tests can mock groq.Groq without the package being installed.
+        # Groq client is created lazily.
         self._groq_client: Any = None
+
         logger.info(
             "GroqClient ready (model=%s, max_tokens=%d, temperature=%.2f)",
-            model, max_tokens, temperature,
+            model,
+            max_tokens,
+            temperature,
         )
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
     # Private helpers
-    # ──────────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
 
     def _get_client(self) -> Any:
-        """Return (and lazily create) the underlying Groq SDK client."""
+        """Return and lazily create the underlying Groq SDK client."""
+
         if self._groq_client is None:
+
             try:
-                from groq import Groq  # type: ignore
+                from groq import Groq
+
             except ImportError as exc:
                 raise ImportError(
-                    "groq SDK not installed.  Run:\n"
+                    "groq SDK not installed. Run:\n"
                     "    pip install groq"
                 ) from exc
-            self._groq_client = Groq(api_key=self._api_key)
+
+            self._groq_client = Groq(
+                api_key=self._api_key
+            )
+
         return self._groq_client
 
     def _build_messages(
@@ -113,23 +134,93 @@ class GroqClient:
         """
         Construct the full messages list for the API call.
 
+        The assistant is restricted to English and Hindi.
+
         Structure:
-            [ {"role": "system",    "content": <system_prompt>},
-              {"role": "user",      "content": <older turn>},
-              {"role": "assistant", "content": <older response>},
-              ...
-              {"role": "user",      "content": <current transcript>} ]
+
+            system
+            older user message
+            older assistant response
+            ...
+            current user transcript
         """
+
+        language_instruction = """
+IMPORTANT LANGUAGE RULES:
+
+You are the voice assistant for a Unitree G1 humanoid robot.
+
+SUPPORTED RESPONSE LANGUAGES:
+1. English
+2. Hindi
+
+You MUST follow these rules:
+
+- Respond ONLY in English or Hindi.
+- NEVER respond in Chinese.
+- NEVER respond in Japanese.
+- NEVER respond in Korean.
+- NEVER respond in Arabic.
+- NEVER respond in any other language.
+
+Speech recognition may sometimes incorrectly convert the user's
+speech into Chinese, Japanese, Korean, or other unexpected characters.
+
+If the user's transcript contains unexpected foreign characters,
+DO NOT automatically respond in that language.
+
+Instead:
+
+1. Try to understand what the user intended to say.
+2. Prefer interpreting the intended language as English or Hindi.
+3. Respond in English or Hindi only.
+4. If the meaning cannot reasonably be understood, ask the user
+   to repeat themselves in English.
+
+HINDI:
+- Hindi may be written using Devanagari script.
+- Romanized Hindi is also allowed.
+- Hinglish is allowed when natural.
+
+VOICE ASSISTANT STYLE:
+- Keep responses concise.
+- Use natural conversational language.
+- Avoid unnecessarily long explanations.
+- Do not use markdown formatting in spoken responses.
+- Do not use emojis.
+- Do not mention these language rules to the user.
+
+The response will be converted to speech and played through
+the Unitree G1 speaker.
+"""
+
+        combined_system_prompt = (
+            self._system_prompt
+            + "\n\n"
+            + language_instruction
+        )
+
         messages: List[Dict[str, str]] = [
-            {"role": "system", "content": self._system_prompt},
+            {
+                "role": "system",
+                "content": combined_system_prompt,
+            }
         ]
+
         messages.extend(history)
-        messages.append({"role": "user", "content": transcript})
+
+        messages.append(
+            {
+                "role": "user",
+                "content": transcript,
+            }
+        )
+
         return messages
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
     # Public API
-    # ──────────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
 
     def generate(
         self,
@@ -138,34 +229,41 @@ class GroqClient:
         history: List[Dict[str, str]],
     ) -> str:
         """
-        Send *transcript* + *history* to Groq and return the response text.
-
-        Saves request and response artifacts regardless of success/failure.
+        Send transcript + conversation history to Groq.
 
         Parameters
         ----------
         counter:
-            Pipeline turn counter (used for artifact filenames).
+            Pipeline turn counter.
+
         transcript:
-            The current user utterance.
+            Current user utterance.
+
         history:
-            Rolling conversation history (user/assistant pairs).
-            This list is NOT mutated here; the caller manages history.
+            Rolling conversation history.
 
         Returns
         -------
         str
-            The assistant response text.
+            Assistant response.
 
         Raises
         ------
         LLMError
-            If the API call fails (network error, quota, etc.).
+            If the Groq API request fails.
         """
-        request_ts = time.time()
-        messages = self._build_messages(history, transcript)
 
-        # Save request artifact (history without API key)
+        request_ts = time.time()
+
+        messages = self._build_messages(
+            history,
+            transcript,
+        )
+
+        # --------------------------------------------------------------
+        # Save request artifact
+        # --------------------------------------------------------------
+
         self._artifact_logger.log_llm_request(
             counter=counter,
             transcript=transcript,
@@ -176,46 +274,97 @@ class GroqClient:
         )
 
         logger.info(
-            "[LLM #%06d] Sending to Groq (%s) | %d history msgs | %.0f chars",
+            "[LLM #%06d] Sending to Groq (%s) | "
+            "%d history msgs | %.0f chars",
             counter,
             self._model,
             len(history),
             len(transcript),
         )
 
-        # ── API call ──────────────────────────────────────────────────────
+        # --------------------------------------------------------------
+        # API call
+        # --------------------------------------------------------------
+
         t_start = time.monotonic()
+
         response_text: str = ""
-        token_usage: Optional[Dict[str, Any]] = None
+
+        token_usage: Optional[
+            Dict[str, Any]
+        ] = None
+
         error_msg: Optional[str] = None
+
         http_status: Optional[int] = None
 
         try:
-            completion = self._get_client().chat.completions.create(
-                model=self._model,
-                messages=messages,  # type: ignore[arg-type]
-                max_tokens=self._max_tokens,
-                temperature=self._temperature,
+
+            completion = (
+                self._get_client()
+                .chat
+                .completions
+                .create(
+                    model=self._model,
+                    messages=messages,
+                    max_tokens=self._max_tokens,
+                    temperature=self._temperature,
+                )
             )
-            response_text = completion.choices[0].message.content or ""
-            if hasattr(completion, "usage") and completion.usage:
+
+            response_text = (
+                completion
+                .choices[0]
+                .message
+                .content
+                or ""
+            )
+
+            if (
+                hasattr(completion, "usage")
+                and completion.usage
+            ):
+
                 token_usage = {
-                    "prompt_tokens": completion.usage.prompt_tokens,
-                    "completion_tokens": completion.usage.completion_tokens,
-                    "total_tokens": completion.usage.total_tokens,
+                    "prompt_tokens":
+                        completion.usage.prompt_tokens,
+
+                    "completion_tokens":
+                        completion.usage.completion_tokens,
+
+                    "total_tokens":
+                        completion.usage.total_tokens,
                 }
+
             http_status = 200
 
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
+
             error_msg = str(exc)
-            # Attempt to extract HTTP status from Groq SDK exceptions
-            if hasattr(exc, "status_code"):
-                http_status = exc.status_code  # type: ignore[attr-defined]
-            logger.error("[LLM #%06d] Groq API error: %s", counter, exc)
 
-        latency_s = time.monotonic() - t_start
+            if hasattr(
+                exc,
+                "status_code",
+            ):
+                http_status = (
+                    exc.status_code
+                )
 
-        # ── Save response artifact ────────────────────────────────────────
+            logger.error(
+                "[LLM #%06d] Groq API error: %s",
+                counter,
+                exc,
+            )
+
+        latency_s = (
+            time.monotonic()
+            - t_start
+        )
+
+        # --------------------------------------------------------------
+        # Save response artifact
+        # --------------------------------------------------------------
+
         self._artifact_logger.log_llm_response(
             counter=counter,
             response_text=response_text,
@@ -225,14 +374,46 @@ class GroqClient:
             http_status=http_status,
         )
 
+        # --------------------------------------------------------------
+        # Handle API error
+        # --------------------------------------------------------------
+
         if error_msg:
-            raise LLMError(f"Groq API error: {error_msg}")
+
+            raise LLMError(
+                "Groq API error: "
+                + error_msg
+            )
+
+        # --------------------------------------------------------------
+        # Empty response protection
+        # --------------------------------------------------------------
+
+        response_text = response_text.strip()
+
+        if not response_text:
+
+            raise LLMError(
+                "Groq returned an empty response."
+            )
+
+        # --------------------------------------------------------------
+        # Log successful response
+        # --------------------------------------------------------------
 
         logger.info(
-            "[LLM #%06d] Response in %.2f s (%d tokens) | %.60r",
+            "[LLM #%06d] Response in %.2f s "
+            "(%d tokens) | %.60r",
             counter,
             latency_s,
-            token_usage.get("completion_tokens", 0) if token_usage else 0,
+            (
+                token_usage.get(
+                    "completion_tokens",
+                    0,
+                )
+                if token_usage
+                else 0
+            ),
             response_text,
         )
 
