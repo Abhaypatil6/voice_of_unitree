@@ -48,20 +48,27 @@ def _make_art(tmp_path: Path) -> ArtifactLogger:
 
 # ── Tests: ALSASpeaker ────────────────────────────────────────────────────────
 
+def _make_popen_mock(returncode: int = 0, stderr: bytes = b""):
+    """Build a mock subprocess.Popen object for ALSASpeaker tests."""
+    mock_proc = MagicMock()
+    mock_proc.returncode = returncode
+    mock_proc.communicate.return_value = (b"", stderr)
+    mock_proc.poll.return_value = returncode
+    return mock_proc
+
+
 def test_alsa_speaker_success(tmp_path: Path) -> None:
     """ALSASpeaker.play() with aplay returning 0 should succeed."""
     wav = _make_tiny_wav(tmp_path / "test.wav")
     speaker = ALSASpeaker(device="hw:1,0")
 
-    result = MagicMock()
-    result.returncode = 0
-    result.stderr = b""
+    mock_proc = _make_popen_mock(returncode=0)
 
-    with patch("subprocess.run", return_value=result) as mock_run:
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
         speaker.play(wav)  # should not raise
 
     # Verify aplay was called with correct device flag
-    cmd = mock_run.call_args[0][0]
+    cmd = mock_popen.call_args[0][0]
     assert "aplay" in cmd
     assert "-D" in cmd
     assert "hw:1,0" in cmd
@@ -72,14 +79,12 @@ def test_alsa_speaker_default_device(tmp_path: Path) -> None:
     wav = _make_tiny_wav(tmp_path / "test.wav")
     speaker = ALSASpeaker(device=None)
 
-    result = MagicMock()
-    result.returncode = 0
-    result.stderr = b""
+    mock_proc = _make_popen_mock(returncode=0)
 
-    with patch("subprocess.run", return_value=result) as mock_run:
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
         speaker.play(wav)
 
-    cmd = mock_run.call_args[0][0]
+    cmd = mock_popen.call_args[0][0]
     assert "-D" not in cmd
 
 
@@ -88,11 +93,9 @@ def test_alsa_speaker_raises_on_aplay_error(tmp_path: Path) -> None:
     wav = _make_tiny_wav(tmp_path / "test.wav")
     speaker = ALSASpeaker()
 
-    result = MagicMock()
-    result.returncode = 1
-    result.stderr = b"ALSA lib: no such device"
+    mock_proc = _make_popen_mock(returncode=1, stderr=b"ALSA lib: no such device")
 
-    with patch("subprocess.run", return_value=result):
+    with patch("subprocess.Popen", return_value=mock_proc):
         try:
             speaker.play(wav)
             assert False, "Expected SpeakerError"
@@ -105,7 +108,7 @@ def test_alsa_speaker_raises_if_aplay_missing(tmp_path: Path) -> None:
     wav = _make_tiny_wav(tmp_path / "test.wav")
     speaker = ALSASpeaker()
 
-    with patch("subprocess.run", side_effect=FileNotFoundError("aplay")):
+    with patch("subprocess.Popen", side_effect=FileNotFoundError("aplay")):
         try:
             speaker.play(wav)
             assert False, "Expected SpeakerError"
@@ -123,7 +126,7 @@ def test_speaker_raises_on_missing_file(tmp_path: Path) -> None:
         pass
 
 
-# ── Tests: G1Speaker (with artifact logging) ──────────────────────────────────
+# ── Tests: G1Speaker (with artifact logging and barge-in) ────────────────────
 
 def test_g1speaker_saves_success_artifact(tmp_path: Path) -> None:
     """Successful playback must create a playback artifact."""
@@ -132,9 +135,10 @@ def test_g1speaker_saves_success_artifact(tmp_path: Path) -> None:
 
     inner = MagicMock(spec=ALSASpeaker)
     inner.backend_name = "alsa"
+    inner.is_playing = False
     inner.play.return_value = None  # success
 
-    g1 = G1Speaker(speaker=inner, artifact_logger=art)
+    g1 = G1Speaker(speaker=inner, artifact_logger=art, interruptible=True)
     ok = g1.play(counter=1, audio_path=wav)
 
     assert ok is True
@@ -152,9 +156,10 @@ def test_g1speaker_saves_failure_artifact(tmp_path: Path) -> None:
 
     inner = MagicMock(spec=ALSASpeaker)
     inner.backend_name = "alsa"
+    inner.is_playing = False
     inner.play.side_effect = SpeakerError("ALSA device busy")
 
-    g1 = G1Speaker(speaker=inner, artifact_logger=art)
+    g1 = G1Speaker(speaker=inner, artifact_logger=art, interruptible=True)
     ok = g1.play(counter=1, audio_path=wav)
 
     assert ok is False
@@ -172,12 +177,40 @@ def test_g1speaker_does_not_raise_on_error(tmp_path: Path) -> None:
 
     inner = MagicMock(spec=ALSASpeaker)
     inner.backend_name = "alsa"
+    inner.is_playing = False
     inner.play.side_effect = RuntimeError("Unexpected crash!")
 
-    g1 = G1Speaker(speaker=inner, artifact_logger=art)
+    g1 = G1Speaker(speaker=inner, artifact_logger=art, interruptible=True)
     # Must not raise
     result = g1.play(counter=1, audio_path=wav)
     assert result is False
+
+
+def test_g1speaker_stop_when_interruptible(tmp_path: Path) -> None:
+    """G1Speaker.stop() should call the inner speaker's stop() when interruptible."""
+    art = _make_art(tmp_path)
+    inner = MagicMock(spec=ALSASpeaker)
+    inner.backend_name = "alsa"
+    inner.stop.return_value = True
+
+    g1 = G1Speaker(speaker=inner, artifact_logger=art, interruptible=True)
+    result = g1.stop()
+
+    assert result is True
+    inner.stop.assert_called_once()
+
+
+def test_g1speaker_stop_when_not_interruptible(tmp_path: Path) -> None:
+    """G1Speaker.stop() should return False when interruptible=False."""
+    art = _make_art(tmp_path)
+    inner = MagicMock(spec=ALSASpeaker)
+    inner.backend_name = "alsa"
+
+    g1 = G1Speaker(speaker=inner, artifact_logger=art, interruptible=False)
+    result = g1.stop()
+
+    assert result is False
+    inner.stop.assert_not_called()
 
 
 # ── Tests: Factory ────────────────────────────────────────────────────────────

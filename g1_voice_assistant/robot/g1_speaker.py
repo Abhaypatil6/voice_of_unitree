@@ -17,11 +17,18 @@ We use two backends, in order of preference:
    - Configure ALSA_OUTPUT_DEVICE in .env to target the correct device
    - Example: ``ALSA_OUTPUT_DEVICE=hw:1,0``  (APE card 1, device 0)
    - Leave blank to use the ALSA ``default`` device
+   - Supports interruptible playback (barge-in) via Popen + kill
 
 2. **sounddevice** (fallback for development machine):
    - Python package that wraps PortAudio
    - Works on the dev laptop for testing
-   - May not have access to the G1's APE device
+   - Supports interruptible playback via sd.stop()
+
+BARGE-IN SUPPORT
+~~~~~~~~~~~~~~~~
+Both backends support interruption via the ``stop()`` method on the
+speaker object.  G1Speaker calls ``speaker.stop()`` when asked to interrupt.
+The ``_is_playing`` attribute is True during playback, False otherwise.
 
 DO NOT USE Unitree SDK AudioClient blindly:
    Before enabling the ``unitree`` backend, inspect the API on the G1:
@@ -37,6 +44,7 @@ Python 3.8 compatible.
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 import wave
 from abc import ABC, abstractmethod
@@ -54,16 +62,33 @@ class SpeakerError(RuntimeError):
 
 
 class BaseSpeaker(ABC):
-    """Abstract speaker output boundary."""
+    """Abstract speaker output boundary with optional barge-in support."""
 
     @abstractmethod
     def play(self, audio_path: Path) -> None:
         """Play the WAV file at *audio_path* and wait for completion."""
 
+    def stop(self) -> bool:
+        """
+        Interrupt current playback.
+
+        Returns
+        -------
+        bool
+            True if playback was successfully interrupted, False if not
+            supported or nothing was playing.
+        """
+        return False  # Default: no barge-in support
+
     @property
     @abstractmethod
     def backend_name(self) -> str:
         """Short identifier for this backend."""
+
+    @property
+    def is_playing(self) -> bool:
+        """True if audio is currently playing."""
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,6 +100,7 @@ class ALSASpeaker(BaseSpeaker):
     Play a WAV file through an ALSA device using ``aplay``.
 
     This is the recommended backend for the G1's APE audio card.
+    Supports barge-in via process kill.
 
     Parameters
     ----------
@@ -85,14 +111,21 @@ class ALSASpeaker(BaseSpeaker):
 
     def __init__(self, device: Optional[str] = None) -> None:
         self._device = device
+        self._proc: Optional[subprocess.Popen] = None  # type: ignore[type-arg]
+        self._lock = threading.Lock()
+        self._playing = False
         logger.info(
-            "ALSASpeaker ready (device=%s)",
+            "ALSASpeaker ready (device=%s, barge-in=supported)",
             device or "default",
         )
 
     @property
     def backend_name(self) -> str:
         return "alsa"
+
+    @property
+    def is_playing(self) -> bool:
+        return self._playing
 
     def play(self, audio_path: Path) -> None:
         audio_path = Path(audio_path)
@@ -104,32 +137,61 @@ class ALSASpeaker(BaseSpeaker):
             cmd += ["-D", self._device]
         cmd.append(str(audio_path))
 
-        logger.info("ALSASpeaker: playing %s (device=%s)", audio_path.name, self._device or "default")
+        logger.info(
+            "ALSASpeaker: playing %s (device=%s)",
+            audio_path.name,
+            self._device or "default",
+        )
 
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=120,
-            )
+            with self._lock:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                self._proc = proc
+                self._playing = True
         except FileNotFoundError:
+            self._playing = False
             raise SpeakerError(
                 "'aplay' not found.  Install with:\n"
                 "    sudo apt install alsa-utils"
             )
-        except subprocess.TimeoutExpired:
-            raise SpeakerError(f"aplay timed out playing {audio_path}")
 
-        if proc.returncode != 0:
-            stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+        try:
+            _, stderr_data = proc.communicate(timeout=120)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            self._playing = False
+            raise SpeakerError(f"aplay timed out playing {audio_path}")
+        finally:
+            with self._lock:
+                self._proc = None
+                self._playing = False
+
+        # returncode -2 / -15 = killed by stop() – treat as clean
+        if returncode not in (0, -2, -15):
+            stderr = (stderr_data or b"").decode("utf-8", errors="replace").strip()
             raise SpeakerError(
-                f"aplay failed (exit {proc.returncode}) for {audio_path.name}.\n"
+                f"aplay failed (exit {returncode}) for {audio_path.name}.\n"
                 f"stderr: {stderr}\n"
                 f"Hint: check ALSA_OUTPUT_DEVICE in .env\n"
                 f"      Run 'aplay -l' to list available devices."
             )
 
         logger.info("ALSASpeaker: playback complete")
+
+    def stop(self) -> bool:
+        """Kill the running aplay process (barge-in)."""
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None:
+                logger.info("ALSASpeaker: interrupting playback (barge-in)")
+                self._proc.terminate()
+                return True
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -142,6 +204,7 @@ class LocalSpeaker(BaseSpeaker):
 
     Useful for testing on the dev laptop.  May not work on the G1 if
     sounddevice cannot access the APE audio device.
+    Supports barge-in via sd.stop().
 
     Parameters
     ----------
@@ -151,11 +214,17 @@ class LocalSpeaker(BaseSpeaker):
 
     def __init__(self, output_device: Optional[int] = None) -> None:
         self._output_device = output_device
-        logger.info("LocalSpeaker ready (device=%s)", output_device)
+        self._playing = False
+        self._lock = threading.Lock()
+        logger.info("LocalSpeaker ready (device=%s, barge-in=supported)", output_device)
 
     @property
     def backend_name(self) -> str:
         return "local"
+
+    @property
+    def is_playing(self) -> bool:
+        return self._playing
 
     def play(self, audio_path: Path) -> None:
         try:
@@ -174,11 +243,28 @@ class LocalSpeaker(BaseSpeaker):
         try:
             sample_rate, data = wavfile.read(str(audio_path))
             logger.info("LocalSpeaker: playing %s (%d Hz)", audio_path.name, sample_rate)
+            with self._lock:
+                self._playing = True
             sd.play(data, samplerate=sample_rate, device=self._output_device)
             sd.wait()
             logger.info("LocalSpeaker: playback complete")
         except Exception as exc:
             raise SpeakerError(f"Local playback failed: {exc}") from exc
+        finally:
+            with self._lock:
+                self._playing = False
+
+    def stop(self) -> bool:
+        """Stop sounddevice playback (barge-in)."""
+        try:
+            import sounddevice as sd  # type: ignore
+            if self._playing:
+                logger.info("LocalSpeaker: interrupting playback (barge-in)")
+                sd.stop()
+                return True
+        except Exception:
+            pass
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -215,12 +301,12 @@ class UnitreeSpeaker(BaseSpeaker):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Playback wrapper with artifact logging
+# Playback wrapper with artifact logging and barge-in support
 # ─────────────────────────────────────────────────────────────────────────────
 
 class G1Speaker:
     """
-    High-level speaker with ArtifactLogger integration.
+    High-level speaker with ArtifactLogger integration and barge-in support.
 
     Wraps a BaseSpeaker backend and saves playback metadata for every
     play() call.
@@ -231,12 +317,24 @@ class G1Speaker:
         The underlying BaseSpeaker backend.
     artifact_logger:
         ArtifactLogger for the current session.
+    interruptible:
+        If True, calling stop() will interrupt ongoing playback.
     """
 
-    def __init__(self, speaker: BaseSpeaker, artifact_logger: ArtifactLogger) -> None:
+    def __init__(
+        self,
+        speaker: BaseSpeaker,
+        artifact_logger: ArtifactLogger,
+        interruptible: bool = True,
+    ) -> None:
         self._speaker = speaker
         self._artifact_logger = artifact_logger
-        logger.info("G1Speaker ready (backend=%s)", speaker.backend_name)
+        self._interruptible = interruptible
+        logger.info(
+            "G1Speaker ready (backend=%s, interruptible=%s)",
+            speaker.backend_name,
+            interruptible,
+        )
 
     def play(self, counter: int, audio_path: Path) -> bool:
         """
@@ -264,10 +362,10 @@ class G1Speaker:
             success = True
         except (SpeakerError, FileNotFoundError) as exc:
             error_msg = str(exc)
-            logger.error("[Speaker #%06d] Playback failed: %s", counter, exc)
+            logger.error("[ERROR] [Speaker #%06d] Playback failed: %s", counter, exc)
         except Exception as exc:
             error_msg = f"Unexpected error: {exc}"
-            logger.exception("[Speaker #%06d] Unexpected playback error", counter)
+            logger.exception("[ERROR] [Speaker #%06d] Unexpected playback error", counter)
 
         end_ts = time.time()
 
@@ -281,6 +379,24 @@ class G1Speaker:
         )
 
         return success
+
+    def stop(self) -> bool:
+        """
+        Interrupt ongoing playback (barge-in).
+
+        Returns
+        -------
+        bool
+            True if playback was interrupted, False otherwise.
+        """
+        if not self._interruptible:
+            return False
+        return self._speaker.stop()
+
+    @property
+    def is_playing(self) -> bool:
+        """True if audio is currently playing."""
+        return self._speaker.is_playing
 
 
 # ─────────────────────────────────────────────────────────────────────────────

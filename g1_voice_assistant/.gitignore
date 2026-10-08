@@ -19,12 +19,20 @@ env/
 # Conversation artifacts (large, generated at runtime)
 conversations/
 
+# TTS audio output files (generated at runtime)
+output/
+
 # Logs
 logs/*.log
 
-# TTS model binaries
+# TTS model binaries (large binary files)
 tts/models/*.onnx
 tts/models/*.onnx.json
+
+# Piper binary (large, downloaded separately)
+piper/
+piper_linux_aarch64.tar.gz
+piper_linux_x86_64.tar.gz
 
 # Editor
 .vscode/
@@ -40,3 +48,7 @@ Thumbs.db
 install/
 build/
 log/
+
+# Temporary audio files
+*.wav.tmp
+/tmp/*.wav

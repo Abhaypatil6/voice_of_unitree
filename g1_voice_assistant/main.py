@@ -1,19 +1,26 @@
 """
 main.py
 -------
-G1 Voice Assistant – Full Pipeline (Stages 5 + 6)
+G1 Voice Assistant – Full Pipeline (ROS 2 / Unitree G1 Mode)
 
 Pipeline:
-    /audio_msg → G1Listener → ConversationManager
+    /audio_msg → G1Listener → VoiceAssistantPipeline
         → GroqClient → TTSEngine → G1Speaker
-        → LOOP
+        → LOOP (listens again automatically)
 
 Usage on the G1:
     source /opt/ros/foxy/setup.bash
     cd ~/g1_voice_assistant
     python3 main.py
 
+For standalone mode (no ROS, local microphone):
+    python3 main_standalone.py
+
 Environment variables are loaded from .env (see .env.example).
+
+Language:
+    The robot ONLY speaks English.  The LLM system prompt enforces this.
+    Non-English input receives an English redirect response.
 
 Python 3.8 compatible.
 """
@@ -53,6 +60,12 @@ class VoiceAssistantPipeline:
     This class is stateful for one session: it holds the conversation
     history, artifact logger, and counter.  Instantiate once per session.
 
+    Barge-in support
+    ----------------
+    When ``_is_speaking`` is True and a new transcript arrives,
+    the speaker is interrupted (if supported by the backend) and
+    the new utterance is processed.
+
     Parameters
     ----------
     artifact_logger:
@@ -65,6 +78,8 @@ class VoiceAssistantPipeline:
         Initialised G1Speaker (or None if tts_engine is None).
     conv_manager:
         Conversation history manager.
+    show_timing:
+        If True, print per-turn latency summary to console.
     """
 
     def __init__(
@@ -74,6 +89,7 @@ class VoiceAssistantPipeline:
         tts_engine: Optional[BaseTTS],
         g1_speaker: Optional[G1Speaker],
         conv_manager: ConversationManager,
+        show_timing: bool = True,
     ) -> None:
         self._art = artifact_logger
         self._groq = groq_client
@@ -81,7 +97,8 @@ class VoiceAssistantPipeline:
         self._speaker = g1_speaker
         self._conv = conv_manager
         self._counter: int = 0
-        self._is_speaking: bool = False  # echo suppression flag
+        self._is_speaking: bool = False  # True while TTS playback is active
+        self._show_timing = show_timing
 
     # ──────────────────────────────────────────────────────────────────────────
     # Main callback (called by G1Listener on each valid transcript)
@@ -94,28 +111,41 @@ class VoiceAssistantPipeline:
         Design: each stage saves its artifact before proceeding.
         If any stage fails, subsequent stages are skipped but previous
         artifacts are preserved.
+
+        Barge-in: if the robot is currently speaking and a new transcript
+        arrives, we interrupt playback and process the new input.
         """
-        # ── Echo suppression: ignore transcripts while speaking ───────────
+        # ── Barge-in: interrupt current playback if speaking ──────────────
         if self._is_speaking:
-            logger.info("Pipeline: skipping transcript (currently speaking)")
-            return
+            if self._speaker is not None and self._speaker.stop():
+                logger.info("[BARGE-IN] Interrupted playback for new input")
+            else:
+                # Speaker not interruptible – skip this transcript
+                logger.info("[PIPELINE] Skipping transcript (currently speaking, no barge-in)")
+                return
 
         self._counter += 1
         turn = self._counter
+        turn_start = time.monotonic()
+
         logger.info("=" * 55)
-        logger.info("[Turn %d] USER: %s", turn, transcript)
+        logger.info("[LISTENING] Turn %d", turn)
+        logger.info("[USER] %s", transcript)
 
         # ── Stage 2: LLM ──────────────────────────────────────────────────
         response_text: Optional[str] = None
+        llm_latency: float = 0.0
         try:
+            llm_start = time.monotonic()
             response_text = self._groq.generate(
                 counter=turn,
                 transcript=transcript,
                 history=self._conv.history,
             )
-            logger.info("[Turn %d] G1  : %s", turn, response_text)
+            llm_latency = time.monotonic() - llm_start
+            logger.info("[ASSISTANT] %s", response_text)
         except LLMError as exc:
-            logger.error("[Turn %d] LLM failed: %s", turn, exc)
+            logger.error("[ERROR] LLM failed: %s", exc)
             return  # STT artifact already saved; abort this turn
 
         # Update conversation history
@@ -123,7 +153,7 @@ class VoiceAssistantPipeline:
 
         # ── Stage 3: TTS ──────────────────────────────────────────────────
         if self._tts is None:
-            logger.info("[Turn %d] TTS disabled – response not spoken", turn)
+            logger.info("[TTS] Disabled – response not spoken")
             return
 
         wav_path = _TTS_OUTPUT_DIR / f"response_{turn:06d}.wav"
@@ -132,15 +162,16 @@ class VoiceAssistantPipeline:
         tts_start = time.monotonic()
         wav_generated: Optional[Path] = None
         tts_error: Optional[str] = None
+        duration: Optional[float] = None
 
+        logger.info("[TTS] Synthesising response...")
         try:
             wav_generated = self._tts.synthesize(response_text, wav_path)
         except TTSError as exc:
             tts_error = str(exc)
-            logger.error("[Turn %d] TTS failed: %s", turn, exc)
+            logger.error("[ERROR] TTS failed: %s", exc)
 
         tts_latency = time.monotonic() - tts_start
-        duration: Optional[float] = None
 
         if wav_generated and hasattr(self._tts, "get_wav_duration"):
             try:
@@ -166,13 +197,23 @@ class VoiceAssistantPipeline:
         if self._speaker is None:
             return
 
+        logger.info("[PLAYING] Speaking response...")
         self._is_speaking = True
         try:
             self._speaker.play(counter=turn, audio_path=wav_generated)
         finally:
             self._is_speaking = False
 
-        logger.info("[Turn %d] complete", turn)
+        total_latency = time.monotonic() - turn_start
+
+        # ── Timing summary ────────────────────────────────────────────────
+        if self._show_timing:
+            logger.info(
+                "[TIMING] Turn %d  |  LLM: %.2fs  TTS: %.2fs  Total: %.2fs",
+                turn, llm_latency, tts_latency, total_latency,
+            )
+
+        logger.info("[LISTENING] Turn %d complete – ready for next input", turn)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,14 +223,18 @@ class VoiceAssistantPipeline:
 def main() -> None:
     """Bootstrap and run the full voice assistant pipeline."""
     logger.info("=" * 60)
-    logger.info("G1 Voice Assistant – Full Pipeline")
+    logger.info("G1 Voice Assistant – Full Pipeline (ROS 2 Mode)")
     logger.info("=" * 60)
     logger.info("ROS topic    : %s", config.ros.audio_topic)
-    logger.info("Groq model   : %s", config.groq.model)
+    logger.info("LLM model    : %s", config.groq.model)
+    logger.info("STT model    : %s (standalone mode only)", config.groq.stt_model)
     logger.info("TTS backend  : %s", config.tts.backend)
     logger.info("Speaker      : %s", config.speaker.backend)
     logger.info("Max history  : %d pairs", config.conversation.max_history_messages)
+    logger.info("Barge-in     : %s", config.speaker.interruptible)
+    logger.info("Timing       : %s", config.logging.show_timing)
     logger.info("Artifacts    : %s", config.paths.conversation_dir)
+    logger.info("Language     : English only (enforced via system prompt)")
     logger.info("=" * 60)
 
     # ── Validate API key ──────────────────────────────────────────────────
@@ -230,8 +275,8 @@ def main() -> None:
             piper_length_scale=config.tts.piper_length_scale,
         )
     except (TTSError, ValueError, ImportError) as exc:
-        logger.warning("TTS engine failed to initialise: %s", exc)
-        logger.warning("Voice responses will be SKIPPED (text-only mode).")
+        logger.warning("[TTS] Engine failed to initialise: %s", exc)
+        logger.warning("[TTS] Voice responses will be SKIPPED (text-only mode).")
         tts_engine = None
 
     # ── Initialise speaker ────────────────────────────────────────────────
@@ -245,10 +290,11 @@ def main() -> None:
             g1_speaker = G1Speaker(
                 speaker=raw_speaker,
                 artifact_logger=artifact_logger,
+                interruptible=config.speaker.interruptible,
             )
         except (ValueError, Exception) as exc:
-            logger.warning("Speaker failed to initialise: %s", exc)
-            logger.warning("Audio playback will be SKIPPED.")
+            logger.warning("[SPEAKER] Failed to initialise: %s", exc)
+            logger.warning("[SPEAKER] Audio playback will be SKIPPED.")
             g1_speaker = None
 
     # ── Initialise conversation manager ──────────────────────────────────
@@ -263,6 +309,7 @@ def main() -> None:
         tts_engine=tts_engine,
         g1_speaker=g1_speaker,
         conv_manager=conv_manager,
+        show_timing=config.logging.show_timing,
     )
 
     # ── Initialise ROS 2 ──────────────────────────────────────────────────
@@ -294,10 +341,13 @@ def main() -> None:
     logger.info("")
     logger.info("✓ ROS 2 node started")
     logger.info("✓ Listening on: %s", config.ros.audio_topic)
+    logger.info("  LLM model  : %s", config.groq.model)
     logger.info("  TTS engine : %s", tts_status)
     logger.info("  Speaker    : %s", "enabled" if spk_status else "DISABLED")
+    logger.info("  Barge-in   : %s", "enabled" if config.speaker.interruptible else "disabled")
+    logger.info("  Language   : English only")
     logger.info("")
-    logger.info("Waiting for speech …  (Ctrl+C to stop)")
+    logger.info("[LISTENING] Waiting for speech …  (Ctrl+C to stop)")
     logger.info("=" * 60)
 
     # ── Spin ──────────────────────────────────────────────────────────────
